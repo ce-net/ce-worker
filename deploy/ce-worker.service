@@ -1,0 +1,18 @@
+[Unit]
+Description=CE native worker (shares cores with the mesh via the local ce-hub)
+After=network-online.target ce-relay.service
+Wants=network-online.target
+
+[Service]
+# Connects to the ce-hub running on this same host (nginx also proxies it at /hub).
+ExecStart=/usr/bin/node /opt/ce-worker/worker.js --hub ws://127.0.0.1:8970 --name relay
+WorkingDirectory=/opt/ce-worker
+Restart=always
+RestartSec=5
+Environment=CE_WORKER_ID_FILE=/opt/ce-worker/worker-id
+# Keep the relay responsive: the worker shares cores but never starves bootstrap/relay duty.
+Nice=10
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target
