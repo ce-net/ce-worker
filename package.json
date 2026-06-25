@@ -1,11 +1,16 @@
 {
   "name": "@ce-net/worker",
-  "version": "0.1.0",
-  "description": "Native headless CE compute node — shares this machine's cores with the mesh via ce-hub. No browser required.",
+  "version": "0.2.0",
+  "description": "Native headless CE compute node — shares this machine's cores with the mesh over libp2p. Attaches to a local ce node, registers the \"ce-worker\" service, and runs WASM/js tasks pushed to it over the mesh. No browser, no hub WebSocket.",
   "type": "module",
   "bin": { "ce-worker": "worker.js" },
   "scripts": {
-    "start": "node worker.js"
+    "start": "node worker.js",
+    "check": "node --check worker.js",
+    "test": "node --check worker.js && node test/smoke.test.js"
+  },
+  "dependencies": {
+    "@ce-net/sdk": "file:../ce-ts"
   },
   "engines": { "node": ">=20" }
 }

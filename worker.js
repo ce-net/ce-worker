@@ -2,32 +2,35 @@
 // ce-worker — a native, headless CE compute node.
 //
 // It does exactly what the in-browser node (web/site/node.html) does, but as a
-// background process: connect to a ce-hub over WebSocket, advertise this
-// machine's capacity, and run WASM tasks pushed to it. No browser required.
+// background process: advertise this machine's capacity to the mesh and run WASM
+// (or js) tasks pushed to it. No browser required.
 //
-// The same file runs on macOS, Linux, and Windows. Point it at any ce-hub:
-//   node worker.js --hub wss://ce-net.com/hub
-//   node worker.js --hub ws://127.0.0.1:8970         # a local hub
+// Transport: the CE mesh (libp2p request/reply on /ce/rpc/1), NOT a hub WebSocket.
+// The worker attaches to a LOCAL ce node over its HTTP+SSE API and becomes a real
+// mesh service:
+//   * it `register`s the service name "ce-worker" on the DHT, so schedulers can
+//     `locate("ce-worker")` and pick an instance;
+//   * it `advertise`s capability tags (cores:N, ram:NN, plus any extra --tags) so
+//     tag-filtered discovery (e.g. require "gpu") finds the right workers;
+//   * it `serve`s the "ce-worker/run" request topic: each request payload is a job
+//     (the same {func,args,module_b64} / {lang:"js",code,...} shape the hub used to
+//     push over its socket), the reply payload is the JSON result.
 //
-// On Node 22+ the global WebSocket is used (zero dependencies). On older Node
-// (e.g. the relay's Node 20) install the standard `ws` package and it is used
-// automatically: `npm i ws`.
+// A client reaches it over the mesh with @ce-net/sdk's `call`:
+//   call(ce, "ce-worker", "ce-worker/run", jobBytes)  // libp2p, relay/NAT-traversed
+//
+// The same file runs on macOS, Linux, and Windows. Point it at any local node:
+//   node worker.js                                   # http://127.0.0.1:8844
+//   node worker.js --node http://127.0.0.1:8844 --tags gpu,region:eu
+//   CE_NODE_URL=http://127.0.0.1:8844 node worker.js
+//
+// Requires the @ce-net/sdk package (declared in package.json). Node 20+.
 
 import os from 'node:os'
 import fs from 'node:fs'
-import path from 'node:path'
-import crypto from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 
-// ---- WebSocket implementation (global on Node 22+, else the `ws` package) ----
-let WS = globalThis.WebSocket
-if (!WS) {
-  try { WS = (await import('ws')).WebSocket } catch { /* fall through */ }
-}
-if (!WS) {
-  console.error('ce-worker: no WebSocket available. Use Node 22+, or run `npm i ws` in this directory.')
-  process.exit(1)
-}
+import { CeClient, serve, register } from '@ce-net/sdk'
 
 // ---- args / env ----
 const argv = process.argv.slice(2)
@@ -39,26 +42,19 @@ function arg(name, def) {
   }
   return def
 }
-const HUB = (arg('hub', process.env.CE_WORKER_HUB) || 'wss://ce-net.com/hub').replace(/\/$/, '')
-const NAME = arg('name', process.env.CE_WORKER_NAME) || os.hostname()
-const HB_MS = 10_000
 
-// ---- stable node id (persisted) ----
-function loadId() {
-  const file = process.env.CE_WORKER_ID_FILE ||
-    path.join(os.homedir(), '.local', 'share', 'ce', 'worker-id')
-  try {
-    const v = fs.readFileSync(file, 'utf8').trim()
-    if (/^[0-9a-f]{64}$/.test(v)) return v
-  } catch { /* generate below */ }
-  const id = crypto.randomBytes(32).toString('hex')
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, id + '\n', { mode: 0o600 })
-  } catch { /* non-fatal: id is still stable for this process */ }
-  return id
-}
-const ID = loadId()
+// Local ce node API base URL the worker attaches to (its window onto the mesh).
+const NODE_URL = (arg('node', process.env.CE_NODE_URL) || 'http://127.0.0.1:8844').replace(/\/$/, '')
+const NAME = arg('name', process.env.CE_WORKER_NAME) || os.hostname()
+// Service name schedulers `locate()` to find compute workers.
+const SERVICE = arg('service', process.env.CE_WORKER_SERVICE) || 'ce-worker'
+// Mesh request topic this worker answers job requests on.
+const RUN_TOPIC = `${SERVICE}/run`
+// Extra capability tags to advertise (comma-separated), e.g. "gpu,region:eu".
+const EXTRA_TAGS = (arg('tags', process.env.CE_WORKER_TAGS) || '')
+  .split(',').map((s) => s.trim()).filter(Boolean)
+// How often to re-advertise the service + tags (DHT provider records expire).
+const ADVERTISE_MS = 60_000
 
 // ---- capability detection (mirrors node.html's `detect()` shape) ----
 function cpuBench() {
@@ -90,7 +86,7 @@ function detectCaps() {
   }
 }
 
-// ---- WASM job execution (mirrors node.html `runJob`) ----
+// ---- WASM/js job execution (mirrors node.html `runJob`; transport-agnostic) ----
 async function runJob(job) {
   const t0 = performance.now()
   try {
@@ -106,49 +102,89 @@ async function runJob(job) {
   }
 }
 
-// ---- connection loop ----
-let caps = detectCaps()
-let ws = null, hb = null, tasks = 0, backoff = 2000
+// ---- mesh wiring ----
+const enc = new TextEncoder()
+const dec = new TextDecoder()
 
 function log(...a) { console.log(new Date().toISOString(), ...a) }
 
-function connect() {
-  const url = HUB + '/node'
-  log(`connecting to ${url}`)
-  ws = new WS(url)
+// Capability tags advertised so tag-filtered discovery (locate require_tags) works:
+// hardware truth derived from caps, plus any operator-supplied --tags.
+function capabilityTags(caps) {
+  return [`cores:${caps.cores}`, `ram:${caps.ram_gb}`, ...EXTRA_TAGS]
+}
 
-  ws.onopen = () => {
-    backoff = 2000
-    caps = detectCaps()
-    ws.send(JSON.stringify({ t: 'hello', id: ID, caps }))
-    log(`online — id=${ID.slice(0, 12)}… cores=${caps.cores} ram=${caps.ram_gb}GB cpu_mark=${caps.cpu_mark}`)
-    clearInterval(hb)
-    hb = setInterval(() => { try { ws.send(JSON.stringify({ t: 'hb' })) } catch { /* ignore */ } }, HB_MS)
+// The mesh request handler: decode a job request, run it, return the JSON result.
+// `req.from` is the authenticated requester NodeId; a real deployment would verify a
+// ce-cap chain here before computing. Always returns a reply so the caller's
+// mesh.request never blocks to timeout.
+async function handleRun(req) {
+  let job
+  try {
+    job = JSON.parse(dec.decode(req.payload))
+  } catch (e) {
+    return enc.encode(JSON.stringify({ ok: false, value: '', ms: 0, error: `bad job payload: ${String(e?.message || e)}` }))
+  }
+  const res = await runJob(job)
+  tasks++
+  log(`task ${job.func}(${(job.args || []).join(',')}) from ${req.from.slice(0, 12)}… -> ${res.ok ? res.value : 'ERR ' + res.error} (${res.ms}ms, total ${tasks})`)
+  return enc.encode(JSON.stringify({ jid: job.jid, ...res }))
+}
+
+let tasks = 0
+
+async function main() {
+  const ce = new CeClient({ baseUrl: NODE_URL })
+  const ac = new AbortController()
+
+  process.on('SIGINT', () => { log('shutting down'); ac.abort(); process.exit(0) })
+  process.on('SIGTERM', () => { ac.abort(); process.exit(0) })
+
+  const caps = detectCaps()
+  log(`ce-worker starting — node=${NODE_URL} name=${NAME} service=${SERVICE}`)
+  log(`capacity — cores=${caps.cores} ram=${caps.ram_gb}GB cpu_mark=${caps.cpu_mark}`)
+
+  // Confirm the local node is reachable before we announce ourselves to the mesh.
+  try {
+    const s = await ce.status()
+    log(`attached to local node — id=${String(s.nodeId || s.node_id || '').slice(0, 12)}… height=${s.height ?? '?'}`)
+  } catch (e) {
+    log(`WARNING: local node at ${NODE_URL} not reachable yet (${String(e?.message || e)}); serve loop will retry`)
   }
 
-  ws.onmessage = async (ev) => {
-    let m
-    try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString()) } catch { return }
-    if (m.t === 'welcome') { log('registered with hub'); return }
-    if (m.t === 'job') {
-      const res = await runJob(m)
-      try { ws.send(JSON.stringify({ t: 'result', jid: m.jid, ...res })) } catch { /* dropped */ }
-      tasks++
-      log(`task ${m.func}(${(m.args || []).join(',')}) -> ${res.ok ? res.value : 'ERR ' + res.error} (${res.ms}ms, total ${tasks})`)
+  // Advertise the service name + capability tags on a loop (records expire). `register`
+  // re-advertises the bare "ce-worker" service so schedulers can `locate` it; the tags
+  // loop adds discoverable capability tags for tag-filtered selection.
+  const advertiseTags = async () => {
+    while (!ac.signal.aborted) {
+      try { await ce.tags.advertiseAll(capabilityTags(caps)) }
+      catch (e) { log('tag advertise failed; will retry', String(e?.message || e)) }
+      await new Promise((r) => setTimeout(r, ADVERTISE_MS))
     }
   }
 
-  ws.onerror = (e) => { log('socket error', String(e?.message || e?.error || e || '')) }
-  ws.onclose = () => {
-    clearInterval(hb)
-    log(`disconnected — reconnecting in ${backoff}ms`)
-    setTimeout(connect, backoff)
-    backoff = Math.min(backoff * 2, 30_000)
-  }
+  log(`online — serving "${RUN_TOPIC}" over the mesh; discoverable as service "${SERVICE}"`)
+
+  // Run the three loops concurrently until aborted: re-advertise the service, the tags,
+  // and serve inbound job requests over the mesh.
+  await Promise.all([
+    register(ce, SERVICE, ADVERTISE_MS, {
+      signal: ac.signal,
+      onWarn: (m, d) => log(m, String(d ?? '')),
+    }),
+    advertiseTags(),
+    serve(ce, [RUN_TOPIC], handleRun, {
+      signal: ac.signal,
+      onWarn: (m, d) => log(m, String(d ?? '')),
+    }),
+  ])
 }
 
-process.on('SIGINT', () => { log('shutting down'); try { ws?.close() } catch { /* ignore */ } process.exit(0) })
-process.on('SIGTERM', () => { try { ws?.close() } catch { /* ignore */ } process.exit(0) })
+// Exported for tests; importing this module does not start the serve loop unless run
+// directly (so a smoke test can exercise the compute path without a live node).
+export { runJob, detectCaps, capabilityTags, handleRun, RUN_TOPIC, SERVICE }
 
-log(`ce-worker starting — hub=${HUB} name=${NAME}`)
-connect()
+const RUN_DIRECTLY = process.argv[1] && import.meta.url === `file://${process.argv[1]}`
+if (RUN_DIRECTLY) {
+  main().catch((e) => { log('fatal', String(e?.stack || e)); process.exit(1) })
+}
