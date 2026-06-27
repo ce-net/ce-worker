@@ -1,0 +1,16 @@
+# ce-worker — native headless CE compute node. Installed + supervised by the one `ce` node via ce-appmgr.
+[app]
+name = "ce-worker"
+version = "0.2.0"
+summary = "Headless compute node — shares this machine's cores with the mesh; runs WASM/js tasks pushed over libp2p."
+runtime = "oci"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+[oci]
+# placeholder base; real packaging (node + worker.js bundle) is a follow-up.
+image = "node:22-slim"
+[sandbox]
+tier = "gvisor"
+net  = "loopback"
+[daemon]
+enabled = true
+restart = "on-failure"
